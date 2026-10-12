@@ -1,0 +1,514 @@
+*
+ * ==========================================================
+ * STM32F103C8T6
+ * INDUSTRIAL MOTOR PROTECTION CONTROLLER
+ * WOKWI SIMULATION
+ * ==========================================================
+ *
+ * MCU:
+ * STM32F103C8T6 Blue Pill
+ *
+ * FEATURES:
+ * - ADC
+ * - PWM
+ * - Closed-loop speed control
+ * - Start/Stop
+ * - Overcurrent protection
+ * - Overtemperature protection
+ * - Overspeed protection
+ * - Stall protection
+ * - Fault latching
+ * - Fault reset
+ * - Hysteresis
+ * - UART diagnostics
+ *
+ * ==========================================================
+ */
+
+#define SPEED_REF_PIN       PA0
+#define SPEED_MEAS_PIN      PA1
+#define CURRENT_PIN         PA2
+#define TEMPERATURE_PIN     PA3
+
+#define START_BUTTON         PB0
+#define RESET_BUTTON         PB1
+
+#define MOTOR_PWM            PA8
+#define MOTOR_ENABLE        PB12
+
+#define RUN_LED              PB13
+#define FAULT_LED            PB14
+#define WARNING_LED          PB15
+
+// ----------------------------------------------------------
+// Protection limits
+// ----------------------------------------------------------
+
+#define MAX_SPEED_RPM        3000.0f
+
+#define MAX_CURRENT_A        8.0f
+#define CURRENT_RELEASE_A   7.0f
+
+#define MAX_TEMP_C           80.0f
+#define TEMP_RELEASE_C       75.0f
+
+#define OVERSPEED_RPM        3000.0f
+#define OVERSPEED_RELEASE    2850.0f
+
+#define STALL_SPEED_RPM      100.0f
+#define STALL_CURRENT_A      3.0f
+
+// ----------------------------------------------------------
+// Control
+// ----------------------------------------------------------
+
+#define KP                   0.35f
+
+// ----------------------------------------------------------
+// Variables
+// ----------------------------------------------------------
+
+float speedReference = 0.0f;
+float measuredSpeed = 0.0f;
+float motorCurrent = 0.0f;
+float motorTemperature = 0.0f;
+
+float pwmCommand = 0.0f;
+
+bool motorRunning = false;
+bool faultLatched = false;
+
+bool overCurrentFault = false;
+bool overTemperatureFault = false;
+bool overSpeedFault = false;
+bool stallFault = false;
+
+unsigned long lastPrint = 0;
+
+// ----------------------------------------------------------
+// ADC
+// ----------------------------------------------------------
+
+float readADCVoltage(uint8_t pin)
+{
+  int raw = analogRead(pin);
+
+  return ((float)raw * 3.3f) / 4095.0f;
+}
+
+// ----------------------------------------------------------
+// Sensor conversion
+// ----------------------------------------------------------
+
+float readSpeedReference()
+{
+  float voltage = readADCVoltage(SPEED_REF_PIN);
+
+  return (voltage / 3.3f) * MAX_SPEED_RPM;
+}
+
+
+float readMeasuredSpeed()
+{
+  float voltage = readADCVoltage(SPEED_MEAS_PIN);
+
+  return (voltage / 3.3f) * 3200.0f;
+}
+
+
+float readCurrent()
+{
+  float voltage = readADCVoltage(CURRENT_PIN);
+
+  return (voltage / 3.3f) * 10.0f;
+}
+
+
+float readTemperature()
+{
+  float voltage = readADCVoltage(TEMPERATURE_PIN);
+
+  return 20.0f + (voltage / 3.3f) * 80.0f;
+}
+
+// ----------------------------------------------------------
+// Fault detection
+// ----------------------------------------------------------
+
+void checkProtection()
+{
+  overCurrentFault = false;
+  overTemperatureFault = false;
+  overSpeedFault = false;
+  stallFault = false;
+
+  // Overcurrent
+  if (motorCurrent >= MAX_CURRENT_A)
+  {
+    overCurrentFault = true;
+  }
+
+  // Overtemperature
+  if (motorTemperature >= MAX_TEMP_C)
+  {
+    overTemperatureFault = true;
+  }
+
+  // Overspeed
+  if (measuredSpeed >= OVERSPEED_RPM)
+  {
+    overSpeedFault = true;
+  }
+
+  // Stall
+  if (motorRunning &&
+      measuredSpeed <= STALL_SPEED_RPM &&
+      motorCurrent >= STALL_CURRENT_A)
+  {
+    stallFault = true;
+  }
+
+  if (overCurrentFault ||
+      overTemperatureFault ||
+      overSpeedFault ||
+      stallFault)
+  {
+    faultLatched = true;
+  }
+}
+
+// ----------------------------------------------------------
+// Fault reset
+// ----------------------------------------------------------
+
+void resetFault()
+{
+  /*
+   * Reset only when dangerous conditions
+   * are no longer present.
+   */
+
+  bool safeCurrent =
+      motorCurrent < CURRENT_RELEASE_A;
+
+  bool safeTemperature =
+      motorTemperature < TEMP_RELEASE_C;
+
+  bool safeSpeed =
+      measuredSpeed < OVERSPEED_RELEASE;
+
+  if (safeCurrent &&
+      safeTemperature &&
+      safeSpeed)
+  {
+    faultLatched = false;
+
+    overCurrentFault = false;
+    overTemperatureFault = false;
+    overSpeedFault = false;
+    stallFault = false;
+
+    Serial.println("FAULT RESET");
+  }
+  else
+  {
+    Serial.println(
+      "RESET BLOCKED: CONDITION STILL UNSAFE");
+  }
+}
+
+// ----------------------------------------------------------
+// Motor stop
+// ----------------------------------------------------------
+
+void stopMotor()
+{
+  motorRunning = false;
+
+  analogWrite(MOTOR_PWM, 0);
+
+  digitalWrite(MOTOR_ENABLE, LOW);
+  digitalWrite(RUN_LED, LOW);
+}
+
+// ----------------------------------------------------------
+// Motor start
+// ----------------------------------------------------------
+
+void startMotor()
+{
+  if (!faultLatched)
+  {
+    motorRunning = true;
+
+    digitalWrite(MOTOR_ENABLE, HIGH);
+    digitalWrite(RUN_LED, HIGH);
+
+    Serial.println("MOTOR STARTED");
+  }
+  else
+  {
+    Serial.println(
+      "START BLOCKED: FAULT ACTIVE");
+  }
+}
+
+// ----------------------------------------------------------
+// Closed-loop PWM controller
+// ----------------------------------------------------------
+
+void controlMotor()
+{
+  if (!motorRunning || faultLatched)
+  {
+    pwmCommand = 0;
+
+    analogWrite(MOTOR_PWM, 0);
+
+    return;
+  }
+
+  float error =
+      speedReference - measuredSpeed;
+
+  pwmCommand += KP * error;
+
+  /*
+   * Limit PWM
+   */
+
+  if (pwmCommand > 255.0f)
+    pwmCommand = 255.0f;
+
+  if (pwmCommand < 0.0f)
+    pwmCommand = 0.0f;
+
+  analogWrite(
+      MOTOR_PWM,
+      (int)pwmCommand);
+}
+
+// ----------------------------------------------------------
+// LED indication
+// ----------------------------------------------------------
+
+void updateLEDs()
+{
+  if (faultLatched)
+  {
+    digitalWrite(FAULT_LED, HIGH);
+    digitalWrite(WARNING_LED, LOW);
+    digitalWrite(RUN_LED, LOW);
+  }
+  else
+  {
+    digitalWrite(FAULT_LED, LOW);
+
+    /*
+     * Warning when approaching limits
+     */
+
+    bool warning =
+        motorCurrent >= 6.5f ||
+        motorTemperature >= 70.0f ||
+        measuredSpeed >= 2700.0f;
+
+    digitalWrite(
+        WARNING_LED,
+        warning ? HIGH : LOW);
+
+    if (motorRunning)
+      digitalWrite(RUN_LED, HIGH);
+    else
+      digitalWrite(RUN_LED, LOW);
+  }
+}
+
+// ----------------------------------------------------------
+// Fault text
+// ----------------------------------------------------------
+
+void printFault()
+{
+  if (!faultLatched)
+  {
+    Serial.println("FAULT: NONE");
+    return;
+  }
+
+  Serial.print("FAULT: ");
+
+  if (overCurrentFault)
+    Serial.print("OVERCURRENT ");
+
+  if (overTemperatureFault)
+    Serial.print("OVERHEAT ");
+
+  if (overSpeedFault)
+    Serial.print("OVERSPEED ");
+
+  if (stallFault)
+    Serial.print("STALL ");
+
+  Serial.println();
+}
+
+// ----------------------------------------------------------
+// Diagnostics
+// ----------------------------------------------------------
+
+void printStatus()
+{
+  Serial.println("--------------------------------");
+
+  Serial.print("Speed Reference : ");
+  Serial.print(speedReference, 1);
+  Serial.println(" RPM");
+
+  Serial.print("Measured Speed  : ");
+  Serial.print(measuredSpeed, 1);
+  Serial.println(" RPM");
+
+  Serial.print("Motor Current   : ");
+  Serial.print(motorCurrent, 2);
+  Serial.println(" A");
+
+  Serial.print("Temperature     : ");
+  Serial.print(motorTemperature, 1);
+  Serial.println(" C");
+
+  Serial.print("PWM             : ");
+  Serial.print(pwmCommand, 1);
+  Serial.println(" / 255");
+
+  Serial.print("Motor           : ");
+
+  if (motorRunning)
+    Serial.println("RUNNING");
+  else
+    Serial.println("STOPPED");
+
+  printFault();
+
+  Serial.println("--------------------------------");
+}
+
+// ----------------------------------------------------------
+// SETUP
+// ----------------------------------------------------------
+
+void setup()
+{
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+
+  pinMode(START_BUTTON, INPUT_PULLUP);
+  pinMode(RESET_BUTTON, INPUT_PULLUP);
+
+  pinMode(MOTOR_PWM, OUTPUT);
+  pinMode(MOTOR_ENABLE, OUTPUT);
+
+  pinMode(RUN_LED, OUTPUT);
+  pinMode(FAULT_LED, OUTPUT);
+  pinMode(WARNING_LED, OUTPUT);
+
+  stopMotor();
+
+  digitalWrite(FAULT_LED, LOW);
+  digitalWrite(WARNING_LED, LOW);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println(" STM32 INDUSTRIAL MOTOR CONTROL ");
+  Serial.println("================================");
+  Serial.println("System initialized.");
+}
+
+// ----------------------------------------------------------
+// LOOP
+// ----------------------------------------------------------
+
+void loop()
+{
+  // Read sensors
+
+  speedReference =
+      readSpeedReference();
+
+  measuredSpeed =
+      readMeasuredSpeed();
+
+  motorCurrent =
+      readCurrent();
+
+  motorTemperature =
+      readTemperature();
+
+  // Buttons
+
+  if (digitalRead(RESET_BUTTON) == LOW)
+  {
+    delay(30);
+
+    if (digitalRead(RESET_BUTTON) == LOW)
+    {
+      resetFault();
+
+      while (
+        digitalRead(RESET_BUTTON) == LOW)
+      {
+        delay(10);
+      }
+    }
+  }
+
+  if (digitalRead(START_BUTTON) == LOW)
+  {
+    delay(30);
+
+    if (digitalRead(START_BUTTON) == LOW)
+    {
+      if (motorRunning)
+        stopMotor();
+      else
+        startMotor();
+
+      while (
+        digitalRead(START_BUTTON) == LOW)
+      {
+        delay(10);
+      }
+    }
+  }
+
+  // Protection
+
+  checkProtection();
+
+  // Safety shutdown
+
+  if (faultLatched)
+  {
+    stopMotor();
+  }
+
+  // Closed-loop controller
+
+  controlMotor();
+
+  // LEDs
+
+  updateLEDs();
+
+  // Diagnostics
+
+  if (millis() - lastPrint >= 500)
+  {
+    lastPrint = millis();
+
+    printStatus();
+  }
+
+  delay(20);
+}
